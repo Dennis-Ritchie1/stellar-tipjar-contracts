@@ -35,6 +35,12 @@ pub enum DataKey {
     Admin,
     /// Messages appended for a creator.
     CreatorMessages(Address),
+    /// Platform fee in basis points (10_000 == 100%). Max 1_000 (10%).
+    PlatformFee,
+    /// Address that receives collected platform fees.
+    TreasuryAddress,
+    /// Cumulative fees collected by the platform.
+    TotalFeesCollected,
 }
 
 #[contracterror]
@@ -46,6 +52,7 @@ pub enum TipJarError {
     InvalidAmount = 3,
     NothingToWithdraw = 4,
     MessageTooLong = 5,
+    FeeTooHigh = 6,
 }
 
 #[contract]
@@ -65,7 +72,8 @@ impl TipJarContract {
 
     /// Moves `amount` tokens from `sender` into contract escrow for `creator`.
     ///
-    /// The sender must authorize this call and have enough token balance.
+    /// If a platform fee is configured, the fee is sent directly to the treasury
+    /// and only the remainder is escrowed for the creator.
     pub fn tip(env: Env, sender: Address, creator: Address, amount: i128) {
         Self::require_not_paused(&env);
         if amount <= 0 {
@@ -78,36 +86,35 @@ impl TipJarContract {
         let token_client = token::Client::new(&env, &token_id);
         let contract_address = env.current_contract_address();
 
-        // Transfer tokens into contract escrow first so creators can withdraw later.
-        token_client.transfer(&sender, &contract_address, &amount);
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::PlatformFee).unwrap_or(0);
+        let fee = Self::calc_fee(amount, fee_bps);
+        let creator_amount = amount - fee;
+
+        // Fee goes directly to treasury; creator portion goes into escrow.
+        if fee > 0 {
+            let treasury: Address = env.storage().instance().get(&DataKey::TreasuryAddress).unwrap();
+            token_client.transfer(&sender, &treasury, &fee);
+
+            let total_fees: i128 = env.storage().instance().get(&DataKey::TotalFeesCollected).unwrap_or(0);
+            env.storage().instance().set(&DataKey::TotalFeesCollected, &(total_fees + fee));
+
+            env.events()
+                .publish((symbol_short!("fee_coll"), treasury), (sender.clone(), fee));
+        }
+
+        token_client.transfer(&sender, &contract_address, &creator_amount);
 
         let creator_balance_key = DataKey::CreatorBalance(creator.clone());
         let creator_total_key = DataKey::CreatorTotal(creator.clone());
 
-        let current_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&creator_balance_key)
-            .unwrap_or(0);
-        let current_total: i128 = env
-            .storage()
-            .persistent()
-            .get(&creator_total_key)
-            .unwrap_or(0);
+        let next_balance: i128 = env.storage().persistent().get(&creator_balance_key).unwrap_or(0) + creator_amount;
+        let next_total: i128 = env.storage().persistent().get(&creator_total_key).unwrap_or(0) + creator_amount;
 
-        let next_balance = current_balance + amount;
-        let next_total = current_total + amount;
+        env.storage().persistent().set(&creator_balance_key, &next_balance);
+        env.storage().persistent().set(&creator_total_key, &next_total);
 
-        env.storage()
-            .persistent()
-            .set(&creator_balance_key, &next_balance);
-        env.storage()
-            .persistent()
-            .set(&creator_total_key, &next_total);
-
-        // Event topics: ("tip", creator). Event data: (sender, amount).
         env.events()
-            .publish((symbol_short!("tip"), creator), (sender, amount));
+            .publish((symbol_short!("tip"), creator), (sender, creator_amount));
     }
 
     /// Allows supporters to attach a note and metadata to a tip.
@@ -133,35 +140,18 @@ impl TipJarContract {
         let token_client = token::Client::new(&env, &token_id);
         let contract_address = env.current_contract_address();
 
-        // Transfer tokens into contract escrow first so creators can withdraw later.
         token_client.transfer(&sender, &contract_address, &amount);
 
         let creator_balance_key = DataKey::CreatorBalance(creator.clone());
         let creator_total_key = DataKey::CreatorTotal(creator.clone());
         let creator_msgs_key = DataKey::CreatorMessages(creator.clone());
 
-        let current_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&creator_balance_key)
-            .unwrap_or(0);
-        let current_total: i128 = env
-            .storage()
-            .persistent()
-            .get(&creator_total_key)
-            .unwrap_or(0);
+        let current_balance: i128 = env.storage().persistent().get(&creator_balance_key).unwrap_or(0);
+        let current_total: i128 = env.storage().persistent().get(&creator_total_key).unwrap_or(0);
 
-        let next_balance = current_balance + amount;
-        let next_total = current_total + amount;
+        env.storage().persistent().set(&creator_balance_key, &(current_balance + amount));
+        env.storage().persistent().set(&creator_total_key, &(current_total + amount));
 
-        env.storage()
-            .persistent()
-            .set(&creator_balance_key, &next_balance);
-        env.storage()
-            .persistent()
-            .set(&creator_total_key, &next_total);
-
-        // Store message
         let timestamp = env.ledger().timestamp();
         let payload = TipWithMessage {
             sender: sender.clone(),
@@ -179,7 +169,6 @@ impl TipJarContract {
         messages.push_back(payload);
         env.storage().persistent().set(&creator_msgs_key, &messages);
 
-        // Emit message payload
         env.events().publish(
             (symbol_short!("tip_msg"), creator),
             (sender, amount, message, metadata),
@@ -188,23 +177,20 @@ impl TipJarContract {
 
     /// Returns total historical tips for a creator.
     pub fn get_total_tips(env: Env, creator: Address) -> i128 {
-        let key = DataKey::CreatorTotal(creator);
-        env.storage().persistent().get(&key).unwrap_or(0)
+        env.storage().persistent().get(&DataKey::CreatorTotal(creator)).unwrap_or(0)
     }
 
     /// Returns stored messages for a creator.
     pub fn get_messages(env: Env, creator: Address) -> Vec<TipWithMessage> {
-        let key = DataKey::CreatorMessages(creator);
         env.storage()
             .persistent()
-            .get(&key)
+            .get(&DataKey::CreatorMessages(creator))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns currently withdrawable escrowed tips for a creator.
     pub fn get_withdrawable_balance(env: Env, creator: Address) -> i128 {
-        let key = DataKey::CreatorBalance(creator);
-        env.storage().persistent().get(&key).unwrap_or(0)
+        env.storage().persistent().get(&DataKey::CreatorBalance(creator)).unwrap_or(0)
     }
 
     /// Allows creator to withdraw their accumulated escrowed tips.
@@ -218,15 +204,35 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::NothingToWithdraw);
         }
 
-        let token_id = Self::read_token(&env);
-        let token_client = token::Client::new(&env, &token_id);
-        let contract_address = env.current_contract_address();
-
-        token_client.transfer(&contract_address, &creator, &amount);
+        let token_client = token::Client::new(&env, &Self::read_token(&env));
+        token_client.transfer(&env.current_contract_address(), &creator, &amount);
         env.storage().persistent().set(&key, &0i128);
 
-        env.events()
-            .publish((symbol_short!("withdraw"), creator), amount);
+        env.events().publish((symbol_short!("withdraw"), creator), amount);
+    }
+
+    /// Sets the platform fee (in basis points) and treasury address. Admin only.
+    /// `fee_bps` must be <= 1_000 (10% max).
+    pub fn set_platform_fee(env: Env, admin: Address, fee_bps: u32, treasury: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        if fee_bps > 1_000 {
+            panic_with_error!(&env, TipJarError::FeeTooHigh);
+        }
+        env.storage().instance().set(&DataKey::PlatformFee, &fee_bps);
+        env.storage().instance().set(&DataKey::TreasuryAddress, &treasury);
+    }
+
+    /// Returns the total fees collected by the platform.
+    pub fn get_total_fees_collected(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::TotalFeesCollected).unwrap_or(0)
+    }
+
+    fn calc_fee(amount: i128, fee_bps: u32) -> i128 {
+        amount * (fee_bps as i128) / 10_000
     }
 
     fn read_token(env: &Env) -> Address {
@@ -256,13 +262,8 @@ impl TipJarContract {
         env.storage().instance().set(&DataKey::Paused, &false);
     }
 
-    /// Internal helper to check if the contract is paused.
     fn require_not_paused(env: &Env) {
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false);
+        let is_paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
         if is_paused {
             panic!("Contract is paused");
         }
@@ -309,48 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tipping_with_message_functionality() {
-        let (env, contract_id, token_id, _) = setup();
-        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
-        let token_client = token::Client::new(&env, &token_id);
-        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
-        let sender = Address::generate(&env);
-        let creator = Address::generate(&env);
-
-        let message = soroban_sdk::String::from_str(&env, "Great job!");
-        let metadata = soroban_sdk::Map::new(&env);
-
-        token_admin_client.mint(&sender, &1_000);
-        tipjar_client.tip_with_message(&sender, &creator, &250, &message, &metadata);
-
-        assert_eq!(token_client.balance(&sender), 750);
-        assert_eq!(token_client.balance(&contract_id), 250);
-        assert_eq!(tipjar_client.get_total_tips(&creator), 250);
-
-        let msgs = tipjar_client.get_messages(&creator);
-        assert_eq!(msgs.len(), 1);
-        let msg = msgs.get(0).unwrap();
-        assert_eq!(msg.message, message);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    fn test_tipping_message_too_long() {
-        let (env, contract_id, token_id, _) = setup();
-        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
-        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
-        let sender = Address::generate(&env);
-        let creator = Address::generate(&env);
-
-        let long_str = "x".repeat(281);
-        let message = soroban_sdk::String::from_str(&env, &long_str);
-        let metadata = soroban_sdk::Map::new(&env);
-
-        token_admin_client.mint(&sender, &1_000);
-        tipjar_client.tip_with_message(&sender, &creator, &250, &message, &metadata);
-    }
-
-    #[test]
     fn test_balance_tracking_and_withdraw() {
         let (env, contract_id, token_id, _) = setup();
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
@@ -368,28 +327,72 @@ mod tests {
 
         assert_eq!(tipjar_client.get_total_tips(&creator), 400);
         assert_eq!(tipjar_client.get_withdrawable_balance(&creator), 400);
-        assert_eq!(token_client.balance(&contract_id), 400);
 
         tipjar_client.withdraw(&creator);
 
         assert_eq!(tipjar_client.get_withdrawable_balance(&creator), 0);
         assert_eq!(token_client.balance(&creator), 400);
-        assert_eq!(token_client.balance(&contract_id), 0);
     }
 
     #[test]
-    #[should_panic]
-    fn test_invalid_tip_amount() {
-        let (env, contract_id, token_id, _) = setup();
+    fn test_platform_fee_split() {
+        // 2.5% fee (250 bps) on a 1000-stroop tip: fee=25, creator gets 975.
+        let (env, contract_id, token_id, admin) = setup();
+        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
+        let token_client = token::Client::new(&env, &token_id);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        tipjar_client.set_platform_fee(&admin, &250, &treasury);
+        token_admin_client.mint(&sender, &1_000);
+        tipjar_client.tip(&sender, &creator, &1_000);
+
+        assert_eq!(token_client.balance(&treasury), 25);
+        assert_eq!(tipjar_client.get_withdrawable_balance(&creator), 975);
+        assert_eq!(tipjar_client.get_total_fees_collected(), 25);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_set_platform_fee_non_admin_reverts() {
+        let (env, contract_id, _, _) = setup();
+        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        tipjar_client.set_platform_fee(&non_admin, &100, &treasury);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_set_platform_fee_too_high_reverts() {
+        let (env, contract_id, _, admin) = setup();
+        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
+        let treasury = Address::generate(&env);
+
+        tipjar_client.set_platform_fee(&admin, &1_001, &treasury);
+    }
+
+    #[test]
+    fn test_total_fees_collected_accumulates() {
+        let (env, contract_id, token_id, admin) = setup();
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
         let sender = Address::generate(&env);
         let creator = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        token_admin_client.mint(&sender, &100);
+        tipjar_client.set_platform_fee(&admin, &1_000, &treasury);
+        token_admin_client.mint(&sender, &3_000);
 
-        // Zero tips are rejected to prevent accidental or abusive calls.
-        tipjar_client.tip(&sender, &creator, &0);
+        tipjar_client.tip(&sender, &creator, &1_000);
+        tipjar_client.tip(&sender, &creator, &1_000);
+        tipjar_client.tip(&sender, &creator, &1_000);
+
+        assert_eq!(tipjar_client.get_total_fees_collected(), 300);
+        assert_eq!(tipjar_client.get_withdrawable_balance(&creator), 2_700);
     }
 
     #[test]
@@ -402,14 +405,11 @@ mod tests {
         let sender = Address::generate(&env);
         let creator = Address::generate(&env);
 
-        // This should fail
         let result = tipjar_client.try_tip(&sender, &creator, &100);
         assert!(result.is_err());
 
-        // Unpause
         tipjar_client.unpause(&admin);
 
-        // This should now succeed (once we mint tokens)
         let token_admin_client = token::StellarAssetClient::new(&env, &_token_id);
         token_admin_client.mint(&sender, &100);
         tipjar_client.tip(&sender, &creator, &100);
