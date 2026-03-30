@@ -6,6 +6,7 @@ mod db {
 }
 mod event_listener;
 mod event_parser;
+pub mod indexer;
 
 use std::{env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
