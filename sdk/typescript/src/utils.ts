@@ -1,6 +1,7 @@
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
-import { Network, TipEvent, WithdrawEvent } from './types';
+import { Network } from './types';
 import { NetworkError } from './errors';
+
+export { parseTipEvent, parseWithdrawEvent } from './events';
 
 export const NETWORK_CONFIG: Record<Network, { rpcUrl: string; networkPassphrase: string }> = {
   testnet: {
@@ -12,21 +13,6 @@ export const NETWORK_CONFIG: Record<Network, { rpcUrl: string; networkPassphrase
     networkPassphrase: 'Public Global Stellar Network ; September 2015',
   },
 };
-
-export function parseTipEvent(event: SorobanRpc.Api.EventResponse): TipEvent {
-  const [senderVal, amountVal] = event.value as unknown[];
-  return {
-    sender: scValToNative(senderVal as Parameters<typeof scValToNative>[0]) as string,
-    amount: BigInt(scValToNative(amountVal as Parameters<typeof scValToNative>[0]) as string),
-  };
-}
-
-export function parseWithdrawEvent(event: SorobanRpc.Api.EventResponse): WithdrawEvent {
-  const [amountVal] = event.value as unknown[];
-  return {
-    amount: BigInt(scValToNative(amountVal as Parameters<typeof scValToNative>[0]) as string),
-  };
-}
 
 export async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
   let attempt = 0;
