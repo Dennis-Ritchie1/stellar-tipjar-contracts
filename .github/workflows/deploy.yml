@@ -1,39 +1,65 @@
-name: Automated Deployment Pipeline
+name: Deploy
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
-    inputs:
-      network:
-        description: 'Target Deployment Network'
-        required: true
-        default: 'testnet'
-        type: choice
-        options:
-          - testnet
-          - mainnet
+    branches: [main]
+  release:
+    types: [published]
 
 jobs:
-  deploy:
+  deploy-testnet:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          override: true
+      - name: Install Rust wasm target
+        run: rustup target add wasm32v1-none
 
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli@20.5.0
+        run: cargo install --locked stellar-cli
 
-      - name: Set Webhook and Source Account
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Deploy to testnet
         env:
-          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
+        run: bash scripts/deploy_testnet.sh
+
+      - name: Commit updated config.json
         run: |
-          chmod +x scripts/deploy.sh
-          ./scripts/deploy.sh ${{ github.event.inputs.network || 'testnet' }} "${{ secrets.STELLAR_SOURCE_KEY }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment/config.json
+          git diff --cached --quiet || git commit -m "chore: update testnet deployment config [skip ci]"
+          git push
+
+  deploy-mainnet:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust wasm target
+        run: rustup target add wasm32v1-none
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Deploy to mainnet
+        env:
+          DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
+          CI_MAINNET_CONFIRMED: "true"
+        run: bash scripts/deploy_mainnet.sh
+
+      - name: Commit updated config.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment/config.json
+          git diff --cached --quiet || git commit -m "chore: update mainnet deployment config [skip ci]"
+          git push
