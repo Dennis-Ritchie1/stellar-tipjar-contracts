@@ -21,3 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
+
+[[test]]
+name = "gas_benchmarks"
+path = "benches/gas_benchmarks.rs"

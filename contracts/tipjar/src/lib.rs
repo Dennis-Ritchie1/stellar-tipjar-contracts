@@ -198,6 +198,8 @@ pub enum DataKey {
     TipCounter,
     /// Off-chain oracle approval flag keyed by condition ID.
     OffchainCondition(BytesN<32>),
+    /// Monotonically increasing contract version, incremented on each upgrade.
+    ContractVersion,
 }
 
 #[contracterror]
@@ -226,6 +228,8 @@ pub enum TipJarError {
     NftNotConfigured = 20,
     SwapFailed = 21,
     ConditionFailed = 22,
+    /// Caller is not the stored admin; upgrade rejected.
+    UpgradeUnauthorized = 23,
 }
 
 #[contract]
@@ -354,5 +358,38 @@ impl TipJarContract {
         );
 
         true
+    }
+
+    /// Upgrades the contract WASM to the bytecode identified by `new_wasm_hash`.
+    ///
+    /// Only the stored admin may call this. The version counter is incremented
+    /// and an `("upgrade", contract_address)` event is emitted.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::UpgradeUnauthorized);
+        }
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        let v: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(1u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &(v + 1));
+        env.events().publish(
+            (symbol_short!("upgrade"), env.current_contract_address()),
+            v + 1,
+        );
+    }
+
+    /// Returns the current contract version (default `1` before any upgrade).
+    pub fn version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(1u32)
     }
 }
