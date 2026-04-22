@@ -1,0 +1,10 @@
+{
+  "testnet": {
+    "current": null,
+    "history": []
+  },
+  "mainnet": {
+    "current": null,
+    "history": []
+  }
+}

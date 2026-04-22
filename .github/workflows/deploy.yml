@@ -16,24 +16,295 @@ on:
           - mainnet
 
 jobs:
-  deploy:
+  # ─────────────────────────────────────────────
+  # Gate: build and test before any deployment
+  # ─────────────────────────────────────────────
+  build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
+    outputs:
+      wasm_path: ${{ steps.build.outputs.wasm_path }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          override: true
+          targets: wasm32v1-none
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: cargo test -p tipjar
+
+      - name: Build contract
+        id: build
+        run: |
+          cargo build -p tipjar --target wasm32v1-none --release
+          echo "wasm_path=target/wasm32v1-none/release/tipjar.wasm" >> "$GITHUB_OUTPUT"
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tipjar-wasm
+          path: target/wasm32v1-none/release/tipjar.wasm
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # Testnet deployment (auto on push to main)
+  # ─────────────────────────────────────────────
+  deploy-testnet:
+    name: Deploy to Testnet
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.network == 'testnet')
+    outputs:
+      contract_id: ${{ steps.deploy.outputs.contract_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli@20.5.0
+        run: cargo install stellar-cli --locked
 
-      - name: Set Webhook and Source Account
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tipjar-wasm
+          path: target/wasm32v1-none/release/
+
+      - name: Optimize WASM
+        run: stellar contract optimize --wasm target/wasm32v1-none/release/tipjar.wasm
+
+      - name: Deploy to testnet
+        id: deploy
+        env:
+          DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
+        run: |
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm target/wasm32v1-none/release/tipjar_optimized.wasm \
+            --source "$DEPLOYER_SECRET" \
+            --network testnet)
+          echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+          echo "CONTRACT_ID=$CONTRACT_ID" >> "$GITHUB_ENV"
+
+      - name: Update deployment registry
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          jq --arg id "$CONTRACT_ID" --arg ts "$TIMESTAMP" \
+            '.testnet.history += [{"contract_id": $id, "timestamp": $ts}] | .testnet.current = $id' \
+            deployment/addresses.json > deployment/addresses.json.tmp
+          mv deployment/addresses.json.tmp deployment/addresses.json
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+
+      - name: Commit updated addresses.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment/addresses.json
+          git diff --staged --quiet || git commit -m "chore(deploy): update testnet contract address [${{ steps.deploy.outputs.contract_id }}]"
+          git push
+
+      - name: Write job summary
+        run: |
+          echo "## 🚀 Testnet Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Network | testnet |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Contract ID | \`${{ steps.deploy.outputs.contract_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Timestamp | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Explorer | [View on Stellar Expert](https://stellar.expert/explorer/testnet/contract/${{ steps.deploy.outputs.contract_id }}) |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────
+  # Mainnet deployment (manual only, with env protection)
+  # ─────────────────────────────────────────────
+  deploy-mainnet:
+    name: Deploy to Mainnet
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.network == 'mainnet'
+    environment: production
+    outputs:
+      contract_id: ${{ steps.deploy.outputs.contract_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Stellar CLI
+        run: cargo install stellar-cli --locked
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tipjar-wasm
+          path: target/wasm32v1-none/release/
+
+      - name: Optimize WASM
+        run: stellar contract optimize --wasm target/wasm32v1-none/release/tipjar.wasm
+
+      - name: Deploy to mainnet
+        id: deploy
+        env:
+          MAINNET_DEPLOYER_SECRET: ${{ secrets.MAINNET_DEPLOYER_SECRET }}
+        run: |
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm target/wasm32v1-none/release/tipjar_optimized.wasm \
+            --source "$MAINNET_DEPLOYER_SECRET" \
+            --network mainnet)
+          echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+          echo "CONTRACT_ID=$CONTRACT_ID" >> "$GITHUB_ENV"
+
+      - name: Update deployment registry
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          jq --arg id "$CONTRACT_ID" --arg ts "$TIMESTAMP" \
+            '.mainnet.history += [{"contract_id": $id, "timestamp": $ts}] | .mainnet.current = $id' \
+            deployment/addresses.json > deployment/addresses.json.tmp
+          mv deployment/addresses.json.tmp deployment/addresses.json
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+
+      - name: Commit updated addresses.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment/addresses.json
+          git diff --staged --quiet || git commit -m "chore(deploy): update mainnet contract address [${{ steps.deploy.outputs.contract_id }}]"
+          git push
+
+      - name: Write job summary
+        run: |
+          echo "## 🚀 Mainnet Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Network | **MAINNET** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Contract ID | \`${{ steps.deploy.outputs.contract_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Timestamp | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Explorer | [View on Stellar Expert](https://stellar.expert/explorer/public/contract/${{ steps.deploy.outputs.contract_id }}) |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────
+  # Post-deployment verification
+  # ─────────────────────────────────────────────
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-testnet, deploy-mainnet]
+    if: always() && (needs.deploy-testnet.result == 'success' || needs.deploy-mainnet.result == 'success')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Stellar CLI
+        run: cargo install stellar-cli --locked
+
+      - name: Determine network and contract ID
+        id: context
+        run: |
+          if [ "${{ needs.deploy-mainnet.result }}" == "success" ]; then
+            echo "network=mainnet" >> "$GITHUB_OUTPUT"
+            echo "contract_id=${{ needs.deploy-mainnet.outputs.contract_id }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "network=testnet" >> "$GITHUB_OUTPUT"
+            echo "contract_id=${{ needs.deploy-testnet.outputs.contract_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Make verify script executable
+        run: chmod +x scripts/verify_deployment.sh
+
+      - name: Run verification
+        run: |
+          ./scripts/verify_deployment.sh \
+            "${{ steps.context.outputs.contract_id }}" \
+            "${{ steps.context.outputs.network }}"
+
+      - name: Send Discord notification
+        if: always()
         env:
           WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CONTRACT_ID: ${{ steps.context.outputs.contract_id }}
+          NETWORK: ${{ steps.context.outputs.network }}
+          STATUS: ${{ job.status }}
         run: |
-          chmod +x scripts/deploy.sh
-          ./scripts/deploy.sh ${{ github.event.inputs.network || 'testnet' }} "${{ secrets.STELLAR_SOURCE_KEY }}"
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not set, skipping notification"
+            exit 0
+          fi
+          
+          if [ "$STATUS" == "success" ]; then
+            COLOR=3066993
+            ICON="✅"
+            TITLE="Deployment Verified"
+          else
+            COLOR=15158332
+            ICON="❌"
+            TITLE="Deployment Verification Failed"
+          fi
+          
+          if [ "$NETWORK" == "mainnet" ]; then
+            EXPLORER_URL="https://stellar.expert/explorer/public/contract/$CONTRACT_ID"
+          else
+            EXPLORER_URL="https://stellar.expert/explorer/testnet/contract/$CONTRACT_ID"
+          fi
+          
+          curl -H "Content-Type: application/json" \
+            -X POST \
+            -d "{
+              \"content\": \"$ICON **TipJar $TITLE**\",
+              \"embeds\": [{
+                \"title\": \"$TITLE\",
+                \"color\": $COLOR,
+                \"fields\": [
+                  {\"name\": \"Network\", \"value\": \"$NETWORK\", \"inline\": true},
+                  {\"name\": \"Contract ID\", \"value\": \"\`$CONTRACT_ID\`\", \"inline\": false},
+                  {\"name\": \"Explorer\", \"value\": \"[View Contract]($EXPLORER_URL)\", \"inline\": false},
+                  {\"name\": \"Workflow Run\", \"value\": \"[View Run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)\", \"inline\": false}
+                ]
+              }]
+            }" \
+            "$WEBHOOK_URL" \
+            --silent --show-error || echo "Warning: Failed to send Discord notification"
